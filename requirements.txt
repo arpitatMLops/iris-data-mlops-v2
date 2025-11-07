@@ -5,3 +5,4 @@ xgboost==1.7.6
 joblib
 boto3
 mlflow
+sagemaker-training

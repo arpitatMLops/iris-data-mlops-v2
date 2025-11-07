@@ -17,9 +17,9 @@ RUN pip install --upgrade pip && pip install -r /opt/ml/requirements.txt
 COPY src/ /opt/ml/
 
 # Environment variables for clean logging
-ENV PYTHONPATH=/opt/ml
+ENV PYTHONPATH=/opt/ml:/opt/ml/src
 ENV PYTHONUNBUFFERED=TRUE
 
 # Define the entrypoint — SageMaker calls this
-ENTRYPOINT ["python", "-m", "src.main"]
+# ENTRYPOINT ["python", "-m", "src.main"]
 
