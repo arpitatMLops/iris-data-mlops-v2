@@ -54,7 +54,7 @@ jobs:
           BUILD_JSON=$(aws codebuild start-build \
             --project-name "${CB_PROJECT_NAME}" \
             --source-type-override S3 \
-            --source-location-override "s3://${ARTIFACTS_BUCKET}/source-${GITHUB_SHA}.zip" \
+            --source-location-override "${ARTIFACTS_BUCKET}/source-${GITHUB_SHA}.zip" \
             --environment-variables-override name=ECR_URI,value="${ECR_URI}" name=IMAGE_TAG,value=latest \
             --output json)
           ID=$(echo "$BUILD_JSON" | jq -r '.build.id')
