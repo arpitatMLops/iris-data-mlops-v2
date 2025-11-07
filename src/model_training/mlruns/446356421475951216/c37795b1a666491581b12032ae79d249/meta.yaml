@@ -1,0 +1,15 @@
+artifact_uri: file:///home/sagemaker-user/iris-data-mlops_v1/src/model_training/mlruns/446356421475951216/c37795b1a666491581b12032ae79d249/artifacts
+end_time: 1762177968907
+entry_point_name: ''
+experiment_id: '446356421475951216'
+lifecycle_stage: active
+run_id: c37795b1a666491581b12032ae79d249
+run_name: defiant-lark-528
+run_uuid: c37795b1a666491581b12032ae79d249
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1762177962210
+status: 3
+tags: []
+user_id: sagemaker-user

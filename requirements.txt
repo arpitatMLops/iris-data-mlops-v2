@@ -1,0 +1,7 @@
+numpy
+pandas
+scikit-learn==1.2.2
+xgboost==1.7.6
+joblib
+boto3
+mlflow

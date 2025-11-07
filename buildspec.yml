@@ -1,0 +1,14 @@
+version: 0.2
+phases:
+  pre_build:
+    commands:
+      - echo "Login to ECR"
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin ${ECR_URI%/*}
+  build:
+    commands:
+      - echo "Build & push image"
+      - docker build -t ${ECR_URI}:${IMAGE_TAG} .
+      - docker push ${ECR_URI}:${IMAGE_TAG}
+artifacts:
+  files:
+    - '**/*'

@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Invoke Lambda to create/update main IaC stack when CodeBuild succeeds
+
+Parameters:
+  TargetStackName:
+    Type: String
+    Default: iris-mlops-dev
+  TemplateS3Url:
+    Type: String
+    Description: S3 URL to cloudformation/iac.yaml
+  CodeBuildProjectName:
+    Type: String
+  ProjectName:
+    Type: String
+    Default: iris-mlops
+  Environment:
+    Type: String
+    AllowedValues: [dev, qa, prod]
+    Default: dev
+  CreateSageMakerPipeline:
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+  PipelineDefKey:
+    Type: String
+    Default: pipelines/dev/pipeline.json
+
+Resources:
+  CfnServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: allow-deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:*','ecr:*','iam:*','logs:*','states:*','sagemaker:*','codebuild:*']
+                Resource: "*"
+
+  LambdaDeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: call-cfn
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['cloudformation:CreateStack','cloudformation:UpdateStack','cloudformation:DescribeStacks','cloudformation:ValidateTemplate']
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnServiceRole.Arn
+
+  LambdaDeployer:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaDeployerRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          TARGET_STACK_NAME: !Ref TargetStackName
+          TEMPLATE_S3_URL: !Ref TemplateS3Url
+          CFN_SERVICE_ROLE_ARN: !GetAtt CfnServiceRole.Arn
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          CREATE_PIPELINE: !Ref CreateSageMakerPipeline
+          PIPELINE_DEF_KEY: !Ref PipelineDefKey
+      Code:
+        ZipFile: |
+          import json, os, boto3, botocore
+          cfn = boto3.client("cloudformation")
+          def stack_exists(name):
+              try:
+                  cfn.describe_stacks(StackName=name); return True
+              except botocore.exceptions.ClientError as e:
+                  if "does not exist" in str(e): return False
+                  raise
+          def handler(event, ctx):
+              stack_name = os.environ["TARGET_STACK_NAME"]
+              params = [
+                  {"ParameterKey":"ProjectName","ParameterValue":os.environ["PROJECT_NAME"]},
+                  {"ParameterKey":"Environment","ParameterValue":os.environ["ENVIRONMENT"]},
+                  {"ParameterKey":"CreateSageMakerPipeline","ParameterValue":os.environ["CREATE_PIPELINE"]},
+                  {"ParameterKey":"PipelineDefKey","ParameterValue":os.environ["PIPELINE_DEF_KEY"]}
+              ]
+              req = dict(
+                  StackName=stack_name,
+                  TemplateURL=os.environ["TEMPLATE_S3_URL"],
+                  Capabilities=['CAPABILITY_NAMED_IAM','CAPABILITY_AUTO_EXPAND'],
+                  RoleARN=os.environ["CFN_SERVICE_ROLE_ARN"],
+                  Parameters=params
+              )
+              if stack_exists(stack_name):
+                  resp = cfn.update_stack(**req); action="UPDATE"
+              else:
+                  resp = cfn.create_stack(**req); action="CREATE"
+              return {"Action": action, "StackId": resp.get("StackId"), "StackName": stack_name}
+
+  CodeBuildSuccessRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: ["aws.codebuild"]
+        detail-type: ["CodeBuild Build State Change"]
+        detail:
+          build-status: ["SUCCEEDED"]
+          project-name: [!Ref CodeBuildProjectName]
+      Targets:
+        - Id: t1
+          Arn: !GetAtt LambdaDeployer.Arn
+
+  AllowEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaDeployer
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CodeBuildSuccessRule.Arn
+
+Outputs:
+  LambdaDeployerArn:
+    Value: !GetAtt LambdaDeployer.Arn

@@ -1,0 +1,6 @@
+artifact_location: file:///home/sagemaker-user/iris-data-mlops_v1/src/model_training/mlruns/446356421475951216
+creation_time: 1762177611862
+experiment_id: '446356421475951216'
+last_update_time: 1762177611862
+lifecycle_stage: active
+name: iris-sagemaker

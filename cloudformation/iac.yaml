@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: iris-mlops-iac S3/ECR + IAM + SageMaker Pipeline + Step Functions + CodeBuild; GitHub OIDC role for Actions to trigger CodeBuild
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: iris-mlops
+  Environment:
+    Type: String
+    AllowedValues: [dev, qa, prod]
+    Default: dev
+  # PipelineDefKey:
+  #   Type: String
+  #   Default: pipelines/dev/pipeline.json
+  #   Description: S3 key where pipeline.json will be stored
+  CreateSageMakerPipeline:
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+  GithubOrg:
+    Type: String
+    Description: repo-owner
+  GithubRepo:
+    Type: String
+    Description: GitHub repository name (for OIDC trust)
+  GithubEnv:
+    Type: String
+    Default: '*'
+    Description: Optional GitHub environment name to scope the OIDC trust (use '*' to allow any)
+  InitialImageTag:
+    Type: String
+    Default: latest
+    Description: Image tag CodeBuild will push to ECR
+
+Conditions:
+  DoCreatePipeline: !Equals [!Ref CreateSageMakerPipeline, 'true']
+  LimitToEnv: !Not [!Equals [!Ref GithubEnv, '*']]
+
+Resources:
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [ sts.amazonaws.com ]
+      ThumbprintList: [ 6938fd4d98bab03faadb97b34396831e3780aea1 ]
+    
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-artifacts-${Environment}-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub arn:aws:s3:::${ArtifactsBucket}
+              - !Sub arn:aws:s3:::${ArtifactsBucket}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-${Environment}
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 20 images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 20 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+   # IAM Role for GitHub Actions via OIDC
+  GithubOIDCRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-gha-oidc
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !If
+                  - LimitToEnv
+                  - !Sub repo:${GithubOrg}/${GithubRepo}:environment:${GithubEnv}
+                  - !Sub repo:${GithubOrg}/${GithubRepo}:*
+      Policies:
+        - PolicyName: gha-start-codebuild-and-cfn
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action: [cloudformation:DescribeStacks]
+                Resource: "*"
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}/*
+              - Effect: Allow
+                Action: [ecr:GetAuthorizationToken]
+                Resource: "*"         
+  # IAM: SageMaker + StepFunctions
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-sagemaker-exec
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sm-exec-s3-ecr-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}/*
+              - Effect: Allow
+                Action: [ecr:GetAuthorizationToken, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:DescribeImages]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability]
+                Resource: !GetAtt EcrRepository.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "*"
+              - Effect: Allow
+                Action: [sagemaker:CreateProcessingJob, sagemaker:CreateTrainingJob, sagemaker:CreateModel, sagemaker:CreateTransformJob, sagemaker:Describe*, sagemaker:List*]
+                Resource: "*"
+
+  SfnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-sfn-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sfn-sagemaker-orchestrate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sagemaker:StartPipelineExecution, sagemaker:DescribePipelineExecution, sagemaker:DescribePipeline, sagemaker:ListPipelineExecutions]
+                Resource: "*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "*"
+
+  # Logs for SFN
+  SfnLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/states/${ProjectName}-${Environment}
+      RetentionInDays: 14
+
+  # SageMaker Pipeline
+  SageMakerPipeline:
+    Type: AWS::SageMaker::Pipeline
+    Condition: DoCreatePipeline
+    Properties:
+      PipelineName: !Sub ${ProjectName}-${Environment}
+      RoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PipelineDescription: !Sub "${ProjectName} ${Environment} pipeline created by CloudFormation"
+      PipelineDefinitionS3Location:
+        Bucket: !Ref ArtifactsBucket
+        Key: !Sub pipelines/${Environment}/pipeline.json
+
+  # Step Functions Orchestrator
+  Orchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Condition: DoCreatePipeline
+    Properties:
+      StateMachineName: !Sub ${ProjectName}-${Environment}-orchestrator
+      RoleArn: !GetAtt SfnExecutionRole.Arn
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt SfnLogs.Arn
+        Level: ALL
+        IncludeExecutionData: true
+      DefinitionString:
+        Fn::Sub: |
+          {
+            "StartAt": "StartPipeline",
+            "States": {
+              "StartPipeline": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sagemaker:startPipelineExecution",
+                "Parameters": {
+                  "PipelineName": "${SageMakerPipeline}",
+                  "PipelineExecutionDisplayName.$": "$.executionName",
+                  "PipelineParameters.$": "$.pipelineParameters"
+                },
+                "ResultPath": "$.pipelineExec",
+                "Next": "WaitBeforeDescribe"
+              },
+              "WaitBeforeDescribe": { "Type": "Wait", "Seconds": 30, "Next": "Describe" },
+              "Describe": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:sagemaker:describePipelineExecution",
+                "Parameters": {
+                  "PipelineExecutionArn.$": "$.pipelineExec.PipelineExecutionArn"
+                },
+                "ResultPath": "$.desc",
+                "Next": "Gate"
+              },
+              "Gate": {
+                "Type": "Choice",
+                "Choices": [
+                  { "Variable": "$.desc.PipelineExecutionStatus", "StringEquals": "Succeeded", "Next": "Success" },
+                  { "Variable": "$.desc.PipelineExecutionStatus", "StringEquals": "Failed", "Next": "Fail" },
+                  { "Variable": "$.desc.PipelineExecutionStatus", "StringEquals": "Stopped", "Next": "Fail" }
+                ],
+                "Default": "WaitBeforeDescribe"
+              },
+              "Fail": { "Type": "Fail" },
+              "Success": { "Type": "Succeed" }
+            }
+          }
+  # CodeBuild (triggered by GitHub Actions)
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: codebuild-ecr-s3-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability, ecr:CompleteLayerUpload, ecr:UploadLayerPart, ecr:InitiateLayerUpload, ecr:BatchGetImage, ecr:PutImage, ecr:DescribeRepositories]
+                Resource: "*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}/*
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "*"
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-docker-build
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_URI
+            Value: !GetAtt EcrRepository.RepositoryUri
+          - Name: IMAGE_TAG
+            Value: !Ref InitialImageTag
+          # - Name: ARTIFACTS_BUCKET
+          #   Value: !Ref ArtifactsBucket
+          # - Name: PIPELINE_DEF_KEY
+          #   Value: !Ref PipelineDefKey
+      Source: 
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                 - echo "Login to ECR"
+                 - aws ecr get-login-password --region $AWS_DEFAULT_REGION |    docker login --username AWS --password-stdin ${ECR_URI%/*}
+            build:
+              commands:
+                 - echo "Build & push image"
+                 - docker build -t ${ECR_URI}:${IMAGE_TAG} .
+                 - docker push ${ECR_URI}:${IMAGE_TAG}
+          artifacts:
+            files:
+               - '**/*'
+      TimeoutInMinutes: 30
+      
+Outputs:
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+  EcrRepositoryUri:
+    Value: !GetAtt EcrRepository.RepositoryUri
+  SageMakerExecutionRoleArn:
+    Value: !GetAtt SageMakerExecutionRole.Arn
+  PipelineName:
+    Condition: DoCreatePipeline
+    Value: !Ref SageMakerPipeline
+  OrchestratorArn:
+    Condition: DoCreatePipeline
+    Value: !Ref Orchestrator
+  SfnLogGroup:
+    Value: !Ref SfnLogs
+  CodeBuildProjectName:
+    Value: !Ref CodeBuildProject
+  GithubOIDCRoleArn:
+    Value: !GetAtt GithubOIDCRole.Arn
+
+

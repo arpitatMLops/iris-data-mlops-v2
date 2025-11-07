@@ -1,0 +1,59 @@
+name: build-and-push
+on:
+  push:
+    branches: [ main ] 
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      STACK_NAME: iris-mlops-dev          
+      AWS_REGION: ap-south-1            
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_GHA_ROLE_ARN }}
+
+      - name: Read CFN outputs (ECR, CodeBuild, Bucket)
+        id: cfn
+        run: |
+          OUT=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query 'Stacks[0].Outputs' --output json)
+          get() { echo "$OUT" | jq -r ".[] | select(.OutputKey==\"$1\") | .OutputValue"; }
+          echo "ECR_URI=$(get EcrRepositoryUri)" >> $GITHUB_ENV
+          echo "CB_PROJECT_NAME=$(get CodeBuildProjectName)" >> $GITHUB_ENV
+          echo "ARTIFACTS_BUCKET=$(get ArtifactsBucketName)" >> $GITHUB_ENV
+
+      - name: Zip repo & upload to S3 (source override)
+        run: |
+          ZIP="source-${GITHUB_SHA}.zip"
+          git archive -o "$ZIP" HEAD
+          aws s3 cp "$ZIP" "s3://${ARTIFACTS_BUCKET}/$ZIP"
+
+      - name: Start CodeBuild (and wait)
+        run: |
+          BUILD_JSON=$(aws codebuild start-build \
+            --project-name "${CB_PROJECT_NAME}" \
+            --source-type-override S3 \
+            --source-location-override "s3://${ARTIFACTS_BUCKET}/source-${GITHUB_SHA}.zip" \
+            --environment-variables-override name=ECR_URI,value="${ECR_URI}" name=IMAGE_TAG,value=latest \
+            --output json)
+          ID=$(echo "$BUILD_JSON" | jq -r '.build.id')
+          echo "Build ID: $ID"
+          # simple wait loop
+          while true; do
+            STATUS=$(aws codebuild batch-get-builds --ids "$ID" --query 'builds[0].buildStatus' --output text)
+            echo "Status: $STATUS"
+            if [ "$STATUS" = "SUCCEEDED" ]; then exit 0; fi
+            if [[ "$STATUS" =~ FAILED|FAULT|STOPPED|TIMED_OUT ]]; then exit 2; fi
+            sleep 10
+          done

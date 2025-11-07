@@ -1,0 +1,15 @@
+artifact_uri: file:///home/sagemaker-user/iris-data-mlops_v1/src/model_training/mlruns/446356421475951216/d686ac695b454682977a4472387b76bf/artifacts
+end_time: 1762177620873
+entry_point_name: ''
+experiment_id: '446356421475951216'
+lifecycle_stage: active
+run_id: d686ac695b454682977a4472387b76bf
+run_name: peaceful-grouse-240
+run_uuid: d686ac695b454682977a4472387b76bf
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1762177612547
+status: 3
+tags: []
+user_id: sagemaker-user
